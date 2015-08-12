@@ -22,10 +22,14 @@ import java.nio.ByteBuffer
 
 import scala.collection.mutable.HashMap
 
-import org.apache.spark.TaskContext
+import org.apache.spark.metrics.MetricsSystem
+import org.apache.spark.{Accumulator, SparkEnv, TaskContextImpl, TaskContext}
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.serializer.SerializerInstance
+import org.apache.spark.unsafe.memory.TaskMemoryManager
 import org.apache.spark.util.ByteBufferInputStream
+import org.apache.spark.util.Utils
+
 
 /**
  * A unit of execution. We have two kinds of Task's in Spark:
@@ -40,15 +44,69 @@ import org.apache.spark.util.ByteBufferInputStream
  * @param stageId id of the stage this task belongs to
  * @param partitionId index of the number in the RDD
  */
-private[spark] abstract class Task[T](val stageId: Int, var partitionId: Int) extends Serializable {
+private[spark] abstract class Task[T](
+    val stageId: Int,
+    val stageAttemptId: Int,
+    val partitionId: Int,
+    internalAccumulators: Seq[Accumulator[Long]]) extends Serializable {
 
-  final def run(attemptId: Long): T = {
-    context = new TaskContext(stageId, partitionId, attemptId, runningLocally = false)
+  /**
+   * The key of the Map is the accumulator id and the value of the Map is the latest accumulator
+   * local value.
+   */
+  type AccumulatorUpdates = Map[Long, Any]
+
+  /**
+   * Called by [[Executor]] to run this task.
+   *
+   * @param taskAttemptId an identifier for this task attempt that is unique within a SparkContext.
+   * @param attemptNumber how many times this task has been attempted (0 for the first attempt)
+   * @return the result of the task along with updates of Accumulators.
+   */
+  final def run(
+    taskAttemptId: Long,
+    attemptNumber: Int,
+    metricsSystem: MetricsSystem)
+  : (T, AccumulatorUpdates) = {
+    context = new TaskContextImpl(
+      stageId,
+      partitionId,
+      taskAttemptId,
+      attemptNumber,
+      taskMemoryManager,
+      metricsSystem,
+      internalAccumulators,
+      runningLocally = false)
+    TaskContext.setTaskContext(context)
+    context.taskMetrics.setHostname(Utils.localHostName())
+    context.taskMetrics.setAccumulatorsUpdater(context.collectInternalAccumulators)
     taskThread = Thread.currentThread()
     if (_killed) {
       kill(interruptThread = false)
     }
-    runTask(context)
+    try {
+      (runTask(context), context.collectAccumulators())
+    } finally {
+      context.markTaskCompleted()
+      try {
+        Utils.tryLogNonFatalError {
+          // Release memory used by this thread for shuffles
+          SparkEnv.get.shuffleMemoryManager.releaseMemoryForThisTask()
+        }
+        Utils.tryLogNonFatalError {
+          // Release memory used by this thread for unrolling blocks
+          SparkEnv.get.blockManager.memoryStore.releaseUnrollMemoryForThisTask()
+        }
+      } finally {
+        TaskContext.unset()
+      }
+    }
+  }
+
+  private var taskMemoryManager: TaskMemoryManager = _
+
+  def setTaskMemoryManager(taskMemoryManager: TaskMemoryManager): Unit = {
+    this.taskMemoryManager = taskMemoryManager
   }
 
   def runTask(context: TaskContext): T
@@ -61,7 +119,7 @@ private[spark] abstract class Task[T](val stageId: Int, var partitionId: Int) ex
   var metrics: Option[TaskMetrics] = None
 
   // Task context, to be initialized in run().
-  @transient protected var context: TaskContext = _
+  @transient protected var context: TaskContextImpl = _
 
   // The actual Thread on which the task is running, if any. Initialized in run().
   @volatile @transient private var taskThread: Thread = _
@@ -70,10 +128,17 @@ private[spark] abstract class Task[T](val stageId: Int, var partitionId: Int) ex
   // initialized when kill() is invoked.
   @volatile @transient private var _killed = false
 
+  protected var _executorDeserializeTime: Long = 0
+
   /**
    * Whether the task has been killed.
    */
   def killed: Boolean = _killed
+
+  /**
+   * Returns the amount of time spent deserializing the RDD and function to be run.
+   */
+  def executorDeserializeTime: Long = _executorDeserializeTime
 
   /**
    * Kills a task by setting the interrupted flag to true. This relies on the upper level Spark
@@ -84,7 +149,7 @@ private[spark] abstract class Task[T](val stageId: Int, var partitionId: Int) ex
   def kill(interruptThread: Boolean) {
     _killed = true
     if (context != null) {
-      context.interrupted = true
+      context.markInterrupted()
     }
     if (interruptThread && taskThread != null) {
       taskThread.interrupt()

@@ -34,7 +34,9 @@ case class Aggregator[K, V, C] (
     mergeValue: (C, V) => C,
     mergeCombiners: (C, C) => C) {
 
-  private val externalSorting = SparkEnv.get.conf.getBoolean("spark.shuffle.spill", true)
+  // When spilling is enabled sorting will happen externally, but not necessarily with an
+  // ExternalSorter.
+  private val isSpillEnabled = SparkEnv.get.conf.getBoolean("spark.shuffle.spill", true)
 
   @deprecated("use combineValuesByKey with TaskContext argument", "0.9.0")
   def combineValuesByKey(iter: Iterator[_ <: Product2[K, V]]): Iterator[(K, C)] =
@@ -42,8 +44,8 @@ case class Aggregator[K, V, C] (
 
   def combineValuesByKey(iter: Iterator[_ <: Product2[K, V]],
                          context: TaskContext): Iterator[(K, C)] = {
-    if (!externalSorting) {
-      val combiners = new AppendOnlyMap[K,C]
+    if (!isSpillEnabled) {
+      val combiners = new AppendOnlyMap[K, C]
       var kv: Product2[K, V] = null
       val update = (hadValue: Boolean, oldValue: C) => {
         if (hadValue) mergeValue(oldValue, kv._2) else createCombiner(kv._2)
@@ -55,24 +57,21 @@ case class Aggregator[K, V, C] (
       combiners.iterator
     } else {
       val combiners = new ExternalAppendOnlyMap[K, V, C](createCombiner, mergeValue, mergeCombiners)
-      while (iter.hasNext) {
-        val pair = iter.next()
-        combiners.insert(pair._1, pair._2)
-      }
-      // TODO: Make this non optional in a future release
-      Option(context).foreach(c => c.taskMetrics.memoryBytesSpilled = combiners.memoryBytesSpilled)
-      Option(context).foreach(c => c.taskMetrics.diskBytesSpilled = combiners.diskBytesSpilled)
+      combiners.insertAll(iter)
+      updateMetrics(context, combiners)
       combiners.iterator
     }
   }
 
   @deprecated("use combineCombinersByKey with TaskContext argument", "0.9.0")
-  def combineCombinersByKey(iter: Iterator[(K, C)]) : Iterator[(K, C)] =
+  def combineCombinersByKey(iter: Iterator[_ <: Product2[K, C]]) : Iterator[(K, C)] =
     combineCombinersByKey(iter, null)
 
-  def combineCombinersByKey(iter: Iterator[(K, C)], context: TaskContext) : Iterator[(K, C)] = {
-    if (!externalSorting) {
-      val combiners = new AppendOnlyMap[K,C]
+  def combineCombinersByKey(iter: Iterator[_ <: Product2[K, C]], context: TaskContext)
+    : Iterator[(K, C)] =
+  {
+    if (!isSpillEnabled) {
+      val combiners = new AppendOnlyMap[K, C]
       var kc: Product2[K, C] = null
       val update = (hadValue: Boolean, oldValue: C) => {
         if (hadValue) mergeCombiners(oldValue, kc._2) else kc._2
@@ -84,14 +83,19 @@ case class Aggregator[K, V, C] (
       combiners.iterator
     } else {
       val combiners = new ExternalAppendOnlyMap[K, C, C](identity, mergeCombiners, mergeCombiners)
-      while (iter.hasNext) {
-        val pair = iter.next()
-        combiners.insert(pair._1, pair._2)
-      }
-      // TODO: Make this non optional in a future release
-      Option(context).foreach(c => c.taskMetrics.memoryBytesSpilled = combiners.memoryBytesSpilled)
-      Option(context).foreach(c => c.taskMetrics.diskBytesSpilled = combiners.diskBytesSpilled)
+      combiners.insertAll(iter)
+      updateMetrics(context, combiners)
       combiners.iterator
+    }
+  }
+
+  /** Update task metrics after populating the external map. */
+  private def updateMetrics(context: TaskContext, map: ExternalAppendOnlyMap[_, _, _]): Unit = {
+    Option(context).foreach { c =>
+      c.taskMetrics().incMemoryBytesSpilled(map.memoryBytesSpilled)
+      c.taskMetrics().incDiskBytesSpilled(map.diskBytesSpilled)
+      c.internalMetricsToAccumulators(
+        InternalAccumulator.PEAK_EXECUTION_MEMORY).add(map.peakMemoryUsedBytes)
     }
   }
 }

@@ -17,8 +17,6 @@
 
 package org.apache.spark.mllib.stat
 
-import breeze.linalg.{DenseVector => BDV}
-
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.mllib.linalg.{Vectors, Vector}
 
@@ -35,54 +33,70 @@ import org.apache.spark.mllib.linalg.{Vectors, Vector}
  * Reference: [[http://en.wikipedia.org/wiki/Algorithms_for_calculating_variance variance-wiki]]
  * Zero elements (including explicit zero values) are skipped when calling add(),
  * to have time complexity O(nnz) instead of O(n) for each column.
+ * @since 1.1.0
  */
 @DeveloperApi
 class MultivariateOnlineSummarizer extends MultivariateStatisticalSummary with Serializable {
 
   private var n = 0
-  private var currMean: BDV[Double] = _
-  private var currM2n: BDV[Double] = _
+  private var currMean: Array[Double] = _
+  private var currM2n: Array[Double] = _
+  private var currM2: Array[Double] = _
+  private var currL1: Array[Double] = _
   private var totalCnt: Long = 0
-  private var nnz: BDV[Double] = _
-  private var currMax: BDV[Double] = _
-  private var currMin: BDV[Double] = _
+  private var nnz: Array[Double] = _
+  private var currMax: Array[Double] = _
+  private var currMin: Array[Double] = _
 
   /**
    * Add a new sample to this summarizer, and update the statistical summary.
    *
    * @param sample The sample in dense/sparse vector format to be added into this summarizer.
    * @return This MultivariateOnlineSummarizer object.
+   * @since 1.1.0
    */
   def add(sample: Vector): this.type = {
     if (n == 0) {
-      require(sample.toBreeze.length > 0, s"Vector should have dimension larger than zero.")
-      n = sample.toBreeze.length
+      require(sample.size > 0, s"Vector should have dimension larger than zero.")
+      n = sample.size
 
-      currMean = BDV.zeros[Double](n)
-      currM2n = BDV.zeros[Double](n)
-      nnz = BDV.zeros[Double](n)
-      currMax = BDV.fill(n)(Double.MinValue)
-      currMin = BDV.fill(n)(Double.MaxValue)
+      currMean = Array.ofDim[Double](n)
+      currM2n = Array.ofDim[Double](n)
+      currM2 = Array.ofDim[Double](n)
+      currL1 = Array.ofDim[Double](n)
+      nnz = Array.ofDim[Double](n)
+      currMax = Array.fill[Double](n)(Double.MinValue)
+      currMin = Array.fill[Double](n)(Double.MaxValue)
     }
 
-    require(n == sample.toBreeze.length, s"Dimensions mismatch when adding new sample." +
-      s" Expecting $n but got ${sample.toBreeze.length}.")
+    require(n == sample.size, s"Dimensions mismatch when adding new sample." +
+      s" Expecting $n but got ${sample.size}.")
 
-    sample.toBreeze.activeIterator.foreach {
-      case (_, 0.0) => // Skip explicit zero elements.
-      case (i, value) =>
-        if (currMax(i) < value) {
-          currMax(i) = value
+    val localCurrMean = currMean
+    val localCurrM2n = currM2n
+    val localCurrM2 = currM2
+    val localCurrL1 = currL1
+    val localNnz = nnz
+    val localCurrMax = currMax
+    val localCurrMin = currMin
+    sample.foreachActive { (index, value) =>
+      if (value != 0.0) {
+        if (localCurrMax(index) < value) {
+          localCurrMax(index) = value
         }
-        if (currMin(i) > value) {
-          currMin(i) = value
+        if (localCurrMin(index) > value) {
+          localCurrMin(index) = value
         }
 
-        val tmpPrevMean = currMean(i)
-        currMean(i) = (currMean(i) * nnz(i) + value) / (nnz(i) + 1.0)
-        currM2n(i) += (value - currMean(i)) * (value - tmpPrevMean)
+        val prevMean = localCurrMean(index)
+        val diff = value - prevMean
+        localCurrMean(index) = prevMean + diff / (localNnz(index) + 1.0)
+        localCurrM2n(index) += (value - localCurrMean(index)) * diff
+        localCurrM2(index) += value * value
+        localCurrL1(index) += math.abs(value)
 
-        nnz(i) += 1.0
+        localNnz(index) += 1.0
+      }
     }
 
     totalCnt += 1
@@ -95,62 +109,75 @@ class MultivariateOnlineSummarizer extends MultivariateStatisticalSummary with S
    *
    * @param other The other MultivariateOnlineSummarizer to be merged.
    * @return This MultivariateOnlineSummarizer object.
+   * @since 1.1.0
    */
   def merge(other: MultivariateOnlineSummarizer): this.type = {
-   if (this.totalCnt != 0 && other.totalCnt != 0) {
+    if (this.totalCnt != 0 && other.totalCnt != 0) {
       require(n == other.n, s"Dimensions mismatch when merging with another summarizer. " +
         s"Expecting $n but got ${other.n}.")
       totalCnt += other.totalCnt
-      val deltaMean: BDV[Double] = currMean - other.currMean
       var i = 0
       while (i < n) {
-        // merge mean together
-        if (other.currMean(i) != 0.0) {
-          currMean(i) = (currMean(i) * nnz(i) + other.currMean(i) * other.nnz(i)) /
-            (nnz(i) + other.nnz(i))
+        val thisNnz = nnz(i)
+        val otherNnz = other.nnz(i)
+        val totalNnz = thisNnz + otherNnz
+        if (totalNnz != 0.0) {
+          val deltaMean = other.currMean(i) - currMean(i)
+          // merge mean together
+          currMean(i) += deltaMean * otherNnz / totalNnz
+          // merge m2n together
+          currM2n(i) += other.currM2n(i) + deltaMean * deltaMean * thisNnz * otherNnz / totalNnz
+          // merge m2 together
+          currM2(i) += other.currM2(i)
+          // merge l1 together
+          currL1(i) += other.currL1(i)
+          // merge max and min
+          currMax(i) = math.max(currMax(i), other.currMax(i))
+          currMin(i) = math.min(currMin(i), other.currMin(i))
         }
-        // merge m2n together
-        if (nnz(i) + other.nnz(i) != 0.0) {
-          currM2n(i) += other.currM2n(i) + deltaMean(i) * deltaMean(i) * nnz(i) * other.nnz(i) /
-            (nnz(i) + other.nnz(i))
-        }
-        if (currMax(i) < other.currMax(i)) {
-          currMax(i) = other.currMax(i)
-        }
-        if (currMin(i) > other.currMin(i)) {
-          currMin(i) = other.currMin(i)
-        }
+        nnz(i) = totalNnz
         i += 1
       }
-      nnz += other.nnz
     } else if (totalCnt == 0 && other.totalCnt != 0) {
       this.n = other.n
-      this.currMean = other.currMean.copy
-      this.currM2n = other.currM2n.copy
+      this.currMean = other.currMean.clone()
+      this.currM2n = other.currM2n.clone()
+      this.currM2 = other.currM2.clone()
+      this.currL1 = other.currL1.clone()
       this.totalCnt = other.totalCnt
-      this.nnz = other.nnz.copy
-      this.currMax = other.currMax.copy
-      this.currMin = other.currMin.copy
+      this.nnz = other.nnz.clone()
+      this.currMax = other.currMax.clone()
+      this.currMin = other.currMin.clone()
     }
     this
   }
 
+  /**
+   * Sample mean of each dimension.
+   *
+   * @since 1.1.0
+   */
   override def mean: Vector = {
     require(totalCnt > 0, s"Nothing has been added to this summarizer.")
 
-    val realMean = BDV.zeros[Double](n)
+    val realMean = Array.ofDim[Double](n)
     var i = 0
     while (i < n) {
       realMean(i) = currMean(i) * (nnz(i) / totalCnt)
       i += 1
     }
-    Vectors.fromBreeze(realMean)
+    Vectors.dense(realMean)
   }
 
+  /**
+   * Sample variance of each dimension.
+   *
+   * @since 1.1.0
+   */
   override def variance: Vector = {
     require(totalCnt > 0, s"Nothing has been added to this summarizer.")
 
-    val realVariance = BDV.zeros[Double](n)
+    val realVariance = Array.ofDim[Double](n)
 
     val denominator = totalCnt - 1.0
 
@@ -158,25 +185,40 @@ class MultivariateOnlineSummarizer extends MultivariateStatisticalSummary with S
     if (denominator > 0.0) {
       val deltaMean = currMean
       var i = 0
-      while (i < currM2n.size) {
+      val len = currM2n.length
+      while (i < len) {
         realVariance(i) =
           currM2n(i) + deltaMean(i) * deltaMean(i) * nnz(i) * (totalCnt - nnz(i)) / totalCnt
         realVariance(i) /= denominator
         i += 1
       }
     }
-
-    Vectors.fromBreeze(realVariance)
+    Vectors.dense(realVariance)
   }
 
+  /**
+   * Sample size.
+   *
+   * @since 1.1.0
+   */
   override def count: Long = totalCnt
 
+  /**
+   * Number of nonzero elements in each dimension.
+   *
+   * @since 1.1.0
+   */
   override def numNonzeros: Vector = {
     require(totalCnt > 0, s"Nothing has been added to this summarizer.")
 
-    Vectors.fromBreeze(nnz)
+    Vectors.dense(nnz)
   }
 
+  /**
+   * Maximum value of each dimension.
+   *
+   * @since 1.1.0
+   */
   override def max: Vector = {
     require(totalCnt > 0, s"Nothing has been added to this summarizer.")
 
@@ -185,9 +227,14 @@ class MultivariateOnlineSummarizer extends MultivariateStatisticalSummary with S
       if ((nnz(i) < totalCnt) && (currMax(i) < 0.0)) currMax(i) = 0.0
       i += 1
     }
-    Vectors.fromBreeze(currMax)
+    Vectors.dense(currMax)
   }
 
+  /**
+   * Minimum value of each dimension.
+   *
+   * @since 1.1.0
+   */
   override def min: Vector = {
     require(totalCnt > 0, s"Nothing has been added to this summarizer.")
 
@@ -196,6 +243,36 @@ class MultivariateOnlineSummarizer extends MultivariateStatisticalSummary with S
       if ((nnz(i) < totalCnt) && (currMin(i) > 0.0)) currMin(i) = 0.0
       i += 1
     }
-    Vectors.fromBreeze(currMin)
+    Vectors.dense(currMin)
+  }
+
+  /**
+   * L2 (Euclidian) norm of each dimension.
+   *
+   * @since 1.2.0
+   */
+  override def normL2: Vector = {
+    require(totalCnt > 0, s"Nothing has been added to this summarizer.")
+
+    val realMagnitude = Array.ofDim[Double](n)
+
+    var i = 0
+    val len = currM2.length
+    while (i < len) {
+      realMagnitude(i) = math.sqrt(currM2(i))
+      i += 1
+    }
+    Vectors.dense(realMagnitude)
+  }
+
+  /**
+   * L1 norm of each dimension.
+   *
+   * @since 1.2.0
+   */
+  override def normL1: Vector = {
+    require(totalCnt > 0, s"Nothing has been added to this summarizer.")
+
+    Vectors.dense(currL1)
   }
 }

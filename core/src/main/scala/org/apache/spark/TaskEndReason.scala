@@ -17,9 +17,12 @@
 
 package org.apache.spark
 
+import java.io.{IOException, ObjectInputStream, ObjectOutputStream}
+
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.storage.BlockManagerId
+import org.apache.spark.util.Utils
 
 /**
  * :: DeveloperApi ::
@@ -68,11 +71,13 @@ case class FetchFailed(
     bmAddress: BlockManagerId,  // Note that bmAddress can be null
     shuffleId: Int,
     mapId: Int,
-    reduceId: Int)
+    reduceId: Int,
+    message: String)
   extends TaskFailedReason {
   override def toErrorString: String = {
     val bmAddressString = if (bmAddress == null) "null" else bmAddress.toString
-    s"FetchFailed($bmAddressString, shuffleId=$shuffleId, mapId=$mapId, reduceId=$reduceId)"
+    s"FetchFailed($bmAddressString, shuffleId=$shuffleId, mapId=$mapId, reduceId=$reduceId, " +
+      s"message=\n$message\n)"
   }
 }
 
@@ -80,18 +85,85 @@ case class FetchFailed(
  * :: DeveloperApi ::
  * Task failed due to a runtime exception. This is the most common failure case and also captures
  * user program exceptions.
+ *
+ * `stackTrace` contains the stack trace of the exception itself. It still exists for backward
+ * compatibility. It's better to use `this(e: Throwable, metrics: Option[TaskMetrics])` to
+ * create `ExceptionFailure` as it will handle the backward compatibility properly.
+ *
+ * `fullStackTrace` is a better representation of the stack trace because it contains the whole
+ * stack trace including the exception and its causes
+ *
+ * `exception` is the actual exception that caused the task to fail. It may be `None` in
+ * the case that the exception is not in fact serializable. If a task fails more than
+ * once (due to retries), `exception` is that one that caused the last failure.
  */
 @DeveloperApi
 case class ExceptionFailure(
     className: String,
     description: String,
     stackTrace: Array[StackTraceElement],
-    metrics: Option[TaskMetrics])
+    fullStackTrace: String,
+    metrics: Option[TaskMetrics],
+    private val exceptionWrapper: Option[ThrowableSerializationWrapper])
   extends TaskFailedReason {
-  override def toErrorString: String = {
-    val stackTraceString =
-      if (stackTrace == null) "null" else stackTrace.map("        " + _).mkString("\n")
-    s"$className ($description)\n$stackTraceString"
+
+  /**
+   * `preserveCause` is used to keep the exception itself so it is available to the
+   * driver. This may be set to `false` in the event that the exception is not in fact
+   * serializable.
+   */
+  private[spark] def this(e: Throwable, metrics: Option[TaskMetrics], preserveCause: Boolean) {
+    this(e.getClass.getName, e.getMessage, e.getStackTrace, Utils.exceptionString(e), metrics,
+      if (preserveCause) Some(new ThrowableSerializationWrapper(e)) else None)
+  }
+
+  private[spark] def this(e: Throwable, metrics: Option[TaskMetrics]) {
+    this(e, metrics, preserveCause = true)
+  }
+
+  def exception: Option[Throwable] = exceptionWrapper.flatMap {
+    (w: ThrowableSerializationWrapper) => Option(w.exception)
+  }
+
+  override def toErrorString: String =
+    if (fullStackTrace == null) {
+      // fullStackTrace is added in 1.2.0
+      // If fullStackTrace is null, use the old error string for backward compatibility
+      exceptionString(className, description, stackTrace)
+    } else {
+      fullStackTrace
+    }
+
+  /**
+   * Return a nice string representation of the exception, including the stack trace.
+   * Note: It does not include the exception's causes, and is only used for backward compatibility.
+   */
+  private def exceptionString(
+      className: String,
+      description: String,
+      stackTrace: Array[StackTraceElement]): String = {
+    val desc = if (description == null) "" else description
+    val st = if (stackTrace == null) "" else stackTrace.map("        " + _).mkString("\n")
+    s"$className: $desc\n$st"
+  }
+}
+
+/**
+ * A class for recovering from exceptions when deserializing a Throwable that was
+ * thrown in user task code. If the Throwable cannot be deserialized it will be null,
+ * but the stacktrace and message will be preserved correctly in SparkException.
+ */
+private[spark] class ThrowableSerializationWrapper(var exception: Throwable) extends
+    Serializable with Logging {
+  private def writeObject(out: ObjectOutputStream): Unit = {
+    out.writeObject(exception)
+  }
+  private def readObject(in: ObjectInputStream): Unit = {
+    try {
+      exception = in.readObject().asInstanceOf[Throwable]
+    } catch {
+      case e : Exception => log.warn("Task exception could not be deserialized", e)
+    }
   }
 }
 
@@ -116,12 +188,22 @@ case object TaskKilled extends TaskFailedReason {
 
 /**
  * :: DeveloperApi ::
+ * Task requested the driver to commit, but was denied.
+ */
+@DeveloperApi
+case class TaskCommitDenied(jobID: Int, partitionID: Int, attemptID: Int) extends TaskFailedReason {
+  override def toErrorString: String = s"TaskCommitDenied (Driver denied task commit)" +
+    s" for job: $jobID, partition: $partitionID, attempt: $attemptID"
+}
+
+/**
+ * :: DeveloperApi ::
  * The task failed because the executor that it was running on was lost. This may happen because
  * the task crashed the JVM.
  */
 @DeveloperApi
-case object ExecutorLostFailure extends TaskFailedReason {
-  override def toErrorString: String = "ExecutorLostFailure (executor lost)"
+case class ExecutorLostFailure(execId: String) extends TaskFailedReason {
+  override def toErrorString: String = s"ExecutorLostFailure (executor ${execId} lost)"
 }
 
 /**

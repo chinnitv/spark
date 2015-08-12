@@ -17,14 +17,15 @@
 
 package org.apache.spark.sql.hive
 
-import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.planning._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.spark.sql.execution._
+import org.apache.spark.sql.execution.datasources.{CreateTableUsing, CreateTableUsingAsSelect, DescribeCommand}
+import org.apache.spark.sql.execution.{DescribeCommand => RunnableDescribeCommand, _}
 import org.apache.spark.sql.hive.execution._
-import org.apache.spark.sql.columnar.InMemoryRelation
+
 
 private[hive] trait HiveStrategies {
   // Possibly being too clever with types here... or not clever enough.
@@ -34,20 +35,22 @@ private[hive] trait HiveStrategies {
 
   object Scripts extends Strategy {
     def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-      case logical.ScriptTransformation(input, script, output, child) =>
-        ScriptTransformation(input, script, output, planLater(child))(hiveContext) :: Nil
+      case logical.ScriptTransformation(input, script, output, child, schema: HiveScriptIOSchema) =>
+        ScriptTransformation(input, script, output, planLater(child), schema)(hiveContext) :: Nil
       case _ => Nil
     }
   }
 
   object DataSinks extends Strategy {
     def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-      case logical.InsertIntoTable(table: MetastoreRelation, partition, child, overwrite) =>
-        InsertIntoHiveTable(table, partition, planLater(child), overwrite)(hiveContext) :: Nil
       case logical.InsertIntoTable(
-             InMemoryRelation(_, _,
-               HiveTableScan(_, table, _)), partition, child, overwrite) =>
-        InsertIntoHiveTable(table, partition, planLater(child), overwrite)(hiveContext) :: Nil
+          table: MetastoreRelation, partition, child, overwrite, ifNotExists) =>
+        execution.InsertIntoHiveTable(
+          table, partition, planLater(child), overwrite, ifNotExists) :: Nil
+      case hive.InsertIntoHiveTable(
+          table: MetastoreRelation, partition, child, overwrite, ifNotExists) =>
+        execution.InsertIntoHiveTable(
+          table, partition, planLater(child), overwrite, ifNotExists) :: Nil
       case _ => Nil
     }
   }
@@ -61,33 +64,52 @@ private[hive] trait HiveStrategies {
       case PhysicalOperation(projectList, predicates, relation: MetastoreRelation) =>
         // Filter out all predicates that only deal with partition keys, these are given to the
         // hive table scan operator to be used for partition pruning.
-        val partitionKeyIds = relation.partitionKeys.map(_.exprId).toSet
-        val (pruningPredicates, otherPredicates) = predicates.partition {
-          _.references.map(_.exprId).subsetOf(partitionKeyIds)
+        val partitionKeyIds = AttributeSet(relation.partitionKeys)
+        val (pruningPredicates, otherPredicates) = predicates.partition { predicate =>
+          !predicate.references.isEmpty &&
+          predicate.references.subsetOf(partitionKeyIds)
         }
 
         pruneFilterProject(
           projectList,
           otherPredicates,
           identity[Seq[Expression]],
-          HiveTableScan(_, relation, pruningPredicates.reduceLeftOption(And))(hiveContext)) :: Nil
+          HiveTableScan(_, relation, pruningPredicates)(hiveContext)) :: Nil
       case _ =>
         Nil
     }
   }
 
+  object HiveDDLStrategy extends Strategy {
+    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case CreateTableUsing(
+          tableName, userSpecifiedSchema, provider, false, opts, allowExisting, managedIfNoPath) =>
+        ExecutedCommand(
+          CreateMetastoreDataSource(
+            tableName, userSpecifiedSchema, provider, opts, allowExisting, managedIfNoPath)) :: Nil
+
+      case CreateTableUsingAsSelect(tableName, provider, false, partitionCols, mode, opts, query) =>
+        val cmd =
+          CreateMetastoreDataSourceAsSelect(tableName, provider, partitionCols, mode, opts, query)
+        ExecutedCommand(cmd) :: Nil
+
+      case _ => Nil
+    }
+  }
+
   case class HiveCommandStrategy(context: HiveContext) extends Strategy {
     def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-      case logical.NativeCommand(sql) =>
-        NativeCommand(sql, plan.output)(context) :: Nil
-
-      case describe: logical.DescribeCommand =>
+      case describe: DescribeCommand =>
         val resolvedTable = context.executePlan(describe.table).analyzed
         resolvedTable match {
           case t: MetastoreRelation =>
-            Seq(DescribeHiveTableCommand(t, describe.output, describe.isExtended)(context))
+            ExecutedCommand(
+              DescribeHiveTableCommand(t, describe.output, describe.isExtended)) :: Nil
+
           case o: LogicalPlan =>
-            Seq(DescribeCommand(planLater(o), describe.output)(context))
+            val resultPlan = context.executePlan(o).executedPlan
+            ExecutedCommand(RunnableDescribeCommand(
+              resultPlan, describe.output, describe.isExtended)) :: Nil
         }
 
       case _ => Nil
